@@ -1,0 +1,343 @@
+
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance Number (1-10)'
+        required: true
+        default: '1'
+        type: string
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: System Information
+        shell: powershell
+        run: |
+          Write-Host "=== ENIGMANO RDP DEPLOYMENT ===" -ForegroundColor Green
+          Write-Host "Instance Number: ${{ inputs.instance_number }}" -ForegroundColor Yellow
+          Write-Host "Runner: $env:RUNNER_NAME" -ForegroundColor Yellow
+          Write-Host "Workflow: $env:GITHUB_WORKFLOW" -ForegroundColor Yellow
+          Write-Host "`n=== SYSTEM SPECIFICATIONS ===" -ForegroundColor Cyan
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, TotalPhysicalMemory
+          Get-CimInstance -ClassName Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+      - name: Fix Windows 11 TPM 2.0 Requirement
+        shell: powershell
+        run: |
+          Write-Host "Configuring Windows compatibility..." -ForegroundColor Green
+          $labConfigPath = "HKLM:\SYSTEM\Setup\LabConfig"
+          if (-not (Test-Path $labConfigPath)) {
+            New-Item -Path $labConfigPath -Force | Out-Null
+          }
+          New-ItemProperty -Path $labConfigPath -Name "BypassTPMCheck" -PropertyType DWord -Value 1 -Force | Out-Null
+
+          $moSetupPath = "HKLM:\SYSTEM\Setup\MoSetup"
+          if (-not (Test-Path $moSetupPath)) {
+            New-Item -Path $moSetupPath -Force | Out-Null
+          }
+          New-ItemProperty -Path $moSetupPath -Name "AllowUpgradesWithUnsupportedTPMOrCPU" -PropertyType DWord -Value 1 -Force | Out-Null
+
+          Write-Host "TPM compatibility registry values configured." -ForegroundColor Green
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Enabling Remote Desktop..." -ForegroundColor Green
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          if (-not (Get-NetFirewallRule -DisplayName "RDP 3389 Tailscale" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule `
+              -DisplayName "RDP 3389 Tailscale" `
+              -Direction Inbound `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -Action Allow `
+              -Profile Any | Out-Null
+          }
+
+          Get-Service TermService | Select-Object Name, Status
+
+      - name: Create User Account
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Setting up user account..." -ForegroundColor Green
+
+          $Password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
+
+          if (Get-LocalUser -Name "Rafael" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "Rafael" -Password $Password
+          }
+          else {
+            New-LocalUser `
+              -Name "Rafael" `
+              -Password $Password `
+              -FullName "Rafael" `
+              -Description "Conta de acesso remoto"
+          }
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+            try {
+              Add-LocalGroupMember -Group $group -Member "Rafael" -ErrorAction Stop
+            }
+            catch {
+              if ($_.Exception.Message -notmatch 'already a member|já é membro') {
+                Write-Warning "Não foi possível adicionar Rafael ao grupo $group : $($_.Exception.Message)"
+              }
+            }
+          }
+
+          Write-Host "Username: Rafael" -ForegroundColor Yellow
+          Write-Host "Conta configurada." -ForegroundColor Green
+
+      - name: Fix Windows Audio
+        shell: powershell
+        run: |
+          Write-Host "Configuring Windows Audio..." -ForegroundColor Green
+
+          foreach ($service in @("Audiosrv", "AudioEndpointBuilder")) {
+            try {
+              Set-Service -Name $service -StartupType Automatic -ErrorAction Stop
+              Start-Service -Name $service -ErrorAction Stop
+              Write-Host "$service started successfully." -ForegroundColor Green
+            }
+            catch {
+              Write-Warning "Could not start $service : $($_.Exception.Message)"
+            }
+          }
+
+          Get-Service -Name "Audiosrv", "AudioEndpointBuilder" |
+            Select-Object Name, Status, StartType
+
+      - name: Configure Network
+        shell: powershell
+        run: |
+          Write-Host "Configuring network adapters..." -ForegroundColor Green
+
+          foreach ($service in @("Dhcp", "Dnscache", "NlaSvc", "netprofm", "WlanSvc")) {
+            try {
+              Set-Service -Name $service -StartupType Automatic -ErrorAction Stop
+              Start-Service -Name $service -ErrorAction SilentlyContinue
+            }
+            catch {
+              Write-Warning "Network service $service: $($_.Exception.Message)"
+            }
+          }
+
+          Get-NetAdapter -ErrorAction SilentlyContinue |
+            Select-Object Name, InterfaceDescription, Status, LinkSpeed
+
+      - name: Install Tailscale (Silent)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Downloading Tailscale..." -ForegroundColor Green
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installerPath`" /quiet /norestart" `
+            -Wait -PassThru
+
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($process.ExitCode)"
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable was not found."
+          }
+
+          Write-Host "Tailscale installed successfully!" -ForegroundColor Green
+
+      - name: Start Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Configure o secret TS_AUTHKEY em Settings > Secrets and variables > Actions."
+          }
+
+          Write-Host "Authenticating Tailscale..." -ForegroundColor Green
+
+          & $ts up `
+            "--authkey=$env:TS_AUTHKEY" `
+            "--hostname=enigmano-${{ github.run_id }}" `
+            --timeout=2m
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale authentication failed."
+          }
+
+          Start-Sleep -Seconds 10
+          & $ts status
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $tsIP = (& $ts ip -4 | Select-Object -First 1)
+
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tsIP)) {
+            throw "Não foi possível obter o IP do Tailscale."
+          }
+
+          $tsIP = $tsIP.Trim()
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale IP: $tsIP" -ForegroundColor Green
+
+      - name: Install Google Chrome (Direct)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Downloading Google Chrome..." -ForegroundColor Green
+
+          $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+          $installerPath = "$env:TEMP\chrome_installer.exe"
+
+          Invoke-WebRequest -Uri $chromeUrl -OutFile $installerPath
+
+          $process = Start-Process -FilePath $installerPath `
+            -ArgumentList "/silent /install" -Wait -PassThru
+
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -ne 0) {
+            throw "Chrome installation failed: $($process.ExitCode)"
+          }
+
+          Write-Host "Google Chrome installed!" -ForegroundColor Green
+
+      - name: Install 7-Zip (Direct)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Downloading 7-Zip..." -ForegroundColor Green
+
+          $zipUrl = "https://www.7-zip.org/a/7z2409-x64.exe"
+          $installerPath = "$env:TEMP\7z-installer.exe"
+
+          Invoke-WebRequest -Uri $zipUrl -OutFile $installerPath
+
+          $process = Start-Process -FilePath $installerPath `
+            -ArgumentList "/S" -Wait -PassThru
+
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -ne 0) {
+            throw "7-Zip installation failed: $($process.ExitCode)"
+          }
+
+          Write-Host "7-Zip installed!" -ForegroundColor Green
+
+      - name: Verify RDP Connection
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $rdp = Get-Service -Name TermService
+          if ($rdp.Status -ne 'Running') {
+            Start-Service -Name TermService
+          }
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($listener) {
+            Write-Host "RDP listener detected on port 3389." -ForegroundColor Green
+          }
+          else {
+            Write-Warning "Port 3389 is not listening. RDP may not be available in this runner."
+          }
+
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+      - name: Connection Details
+        shell: powershell
+        run: |
+          Write-Host "`n=== CONNECTION DETAILS (TAILSCALE) ===" -ForegroundColor Green
+          Write-Host "╔══════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║         ENIGMANO RDP ACCESS          ║" -ForegroundColor Cyan
+          Write-Host "╠══════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║ Host: $env:TAILSCALE_IP"
+          Write-Host "║ Username: Rafael"
+          Write-Host "║ Password: P@ssw0rd!"
+          Write-Host "║ Account: Administrator"
+          Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Cyan
+
+          Write-Host "`nConnection Instructions:" -ForegroundColor Yellow
+          Write-Host "1. Install Tailscale on your device"
+          Write-Host "2. Log in with the same Tailscale account"
+          Write-Host "3. Open Remote Desktop and enter the IP above"
+          Write-Host "4. Use the configured credentials"
+
+      - name: Keep Session Alive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $counter = 0
+          $deadline = (Get-Date).AddHours(5)
+
+          Write-Host "=== SESSION ACTIVE ===" -ForegroundColor Green
+          Write-Host "Runner is temporary; availability depends on GitHub Actions limits."
+
+          while ((Get-Date) -lt $deadline) {
+            $counter++
+            Write-Host "Session active - Heartbeat #$counter ($(Get-Date))" -ForegroundColor Green
+
+            & $ts status
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Tailscale status returned an error."
+            }
+
+            foreach ($service in @("Audiosrv", "AudioEndpointBuilder")) {
+              try {
+                Start-Service -Name $service -ErrorAction SilentlyContinue
+              }
+              catch {}
+            }
+
+            Start-Sleep -Seconds 60
+          }
+
+          Write-Host "Session monitoring finished." -ForegroundColor Yellow
+          
